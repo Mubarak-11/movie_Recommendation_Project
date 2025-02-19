@@ -516,7 +516,7 @@ def main():
 
         logger.info(f"Original dataset size: {len(data['movie_ratings'])}")
         
-        data['movie_ratings'] = data['movie_ratings'].sample(n=50000, random_state=42)
+        data['movie_ratings'] = data['movie_ratings'].sample(n=50000, random_state=42)  #using a random sample of 50,000 from the movie_ratings
         logger.info(f"Sampled dataset size: {len(data['movie_ratings'])}")
         #movie_ratings = processor.process_file('Movie_ratings.csv', sep=',')
         #print(data['movie_ratings'].head(),"\n")
