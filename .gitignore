@@ -96,3 +96,6 @@ data/processed/movie_ratings/year=2008/cf1db89cf8e448cd928deec0ed132213-0.parque
 cosine_similarity_implementation.py
 matrix_fac_practise.py
 Matrix_fact_using_pytorch.py
+ratings.dat
+similarity_matrix.mmap
+Movie_ratings.csv
