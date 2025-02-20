@@ -383,6 +383,11 @@ class matrix_fact(nn.Module):
         self.user_factors  = nn.Embedding(n_users, n_factors)
         self.movie_factors = nn.Embedding(n_movies, n_factors)
 
+        # Add normalization and dropout
+        self.user_norm = nn.LayerNorm(n_factors)
+        self.movie_norm = nn.LayerNorm(n_factors)
+        self.dropout = nn.Dropout(0.2)
+
         #initilize the embeddings with random values
         self.user_factors.weight.data.normal_(0,0.1)
         self.movie_factors.weight.data.normal_(0, 0.1)
@@ -412,7 +417,7 @@ class matrix_fact(nn.Module):
         return predicitions
     
     #train the model now
-    def train_model(movie_ratings, n_factors = 30, n_epochs = 50):
+    def train_model(movie_ratings, n_factors = 30, n_epochs = 50, batch_size= 50):
         
         #create mapping dictonaries for reindexing: This is needed for the embeddings
         user_mapping = {old_id: new_id for new_id, old_id in 
@@ -431,16 +436,16 @@ class matrix_fact(nn.Module):
 
 
         model = matrix_fact(n_users, n_movies, n_factors)
-        optimizer = optim.Adam(model.parameters(), lr = 0.001, weight_decay = 0.0005)
+        optimizer = optim.Adam(model.parameters(), lr = 0.005, weight_decay = 0.0005)
 
         #define the Mean squared Error for error calculation
-        criterion = nn.MSELoss()
+        criterion = nn.SmoothL1Loss()
 
         ratings_scale = 5.0   #used to bring the ratings to 0-1, rather than 1-5, easier for the model to understand
 
         #create dataset/dataloader
         dataset = data_for_mf(movie_ratings, ratings_scale)
-        dataloader = DataLoader(dataset, batch_size = 32, shuffle = True)
+        dataloader = DataLoader(dataset, batch_size = 4096, shuffle = True)
 
         
         #keep track of best model/loss
@@ -527,8 +532,8 @@ def main():
         max_user_id = data['movie_ratings']['userID'].max()
         max_movie_id = data['movie_ratings']['movieID'].max()
         
-        logger.info(f"Number of unique users: {n_users}, Max user ID: {max_user_id}")
-        logger.info(f"Number of unique movies: {n_movies}, Max movie ID: {max_movie_id}")
+        logger.info(f"Number of unique users: {n_users}")
+        logger.info(f"Number of unique movies: {n_movies}")
 
         processing_time = time.time() - start_time  #calculate duration 
         logger.info(f"Data loading in:  {processing_time:.2f} seconds\n")
@@ -608,6 +613,8 @@ def main():
     """
 
     #lets test the matrix factorization with our raw data now:
+
+    """
     try:
     
         # Train model
@@ -616,7 +623,7 @@ def main():
             model, ratings_scale, (user_mapping, movie_mapping) = matrix_fact.train_model(
                 data["movie_ratings"],
                 n_factors=30,
-                n_epochs=50
+                n_epochs=100
             )
             logging.info("Model training completed Successfully!")
             logging.info(f"Created embeddings for {len(user_mapping)} users and {len(movie_mapping)} movies")
@@ -627,10 +634,104 @@ def main():
                 # Could add CPU fallback here
             else:
                 raise e
+            
+        processing_time = time.time() - start_time  #calculate duration 
+        logger.info(f"Model Training in:  {processing_time:.2f} seconds\n")
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
         return None
+    """
+    #Lets train the model on the ETL we saved!
+    try:
+
+        # 1. Load processed data
+        logger.info("Initializing data loader...")
+        base_path = Path("data/processed")
+
+        logger.info(f"Loading data from parquet files")
+        try:
+            # Read partitioned parquet data
+            movie_ratings = pd.read_parquet(str(base_path / "movie_ratings"),engine='pyarrow')
+            
+            logger.info(f"Original Dataset size: {len(movie_ratings):,}")
+
+            #take a sample for training the model quicker:
+            movie_ratings = movie_ratings.sample(n=750000, random_state= 42)
+            logger.info(f"Sampled dataset size: {len(movie_ratings):,}")
+            
+            logger.info(f"Unique users in sample: {movie_ratings['userID'].nunique():,}")
+            logger.info(f"Unique movies in sample: {movie_ratings['movieID'].nunique():,}")
+            logger.info(f"Memory usage: {movie_ratings.memory_usage().sum() / 1024**2:.2f} MB")
+            
+            
+            # 3. Train model with optimized parameters
+            logger.info("Starting model training...")
+            model, ratings_scale, (user_mapping, movie_mapping) = matrix_fact.train_model(
+                movie_ratings,
+                n_factors=64,
+                n_epochs=50, 
+                batch_size=4096
+            )
+
+            #save model/mappings
+            save_path = Path("model")
+            save_path.mkdir(exist_ok= True)
+
+            #save model state:
+            torch.save(model.state_dict(), save_path / "movie_recommender_model.pth")
+
+            #save these mappings for future use:
+            mapping_info = {
+                'user_mapping': user_mapping,
+                'movie_mapping': movie_mapping,
+                'ratings_scale': ratings_scale
+            }
+            torch.save(mapping_info, save_path / "mapping_info.pth")
+
+            logger.info("model training completed successfully!!")
+            #logger.info(f"Created embeddings for {len(user_mapping):,} users and {len(movie_mapping):,} movies")
+            #logger.info(f"Model and mappings saved to {save_path}")
+
+             #lets test the model now:
+    
+            logger.info("Testing the model predictions...")
+
+            # Get the first few users for testing
+            test_users = movie_ratings['userID'].unique()[:5]  # Test first 5 users
+            logger.info(f"Testing predictions for users: {test_users}")
+
+            with torch.no_grad():
+                for test_user in test_users:
+                    user_data = movie_ratings[movie_ratings['userID'] == test_user].head()  # Get first 5 movies for each user
+                    logger.info(f"\nPredictions for user {test_user}:")
+                    
+                    if len(user_data) > 0:
+                        for _, row in user_data.iterrows():
+                            user = torch.LongTensor([user_mapping[row['userID']]]).to(DEVICE)
+                            movie = torch.LongTensor([movie_mapping[row['movieID']]]).to(DEVICE)
+                            prediction = model(user, movie)
+
+                            scaled_prediction = prediction.item() * ratings_scale
+                            logger.info(f"Movie {row['movieID']}: Predicted = {scaled_prediction:.2f}, Actual = {row['rating']}")
+                    else:
+                        logger.info(f"No ratings found for user {test_user}")
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                logger.error("GPU memory error. Consider: ")
+                logger.error(" Reducing batch_size, Reducing n_factors or taking a sample from the data (50,000)")
+                raise e
+        
+        total_time = time.time() - start_time
+        logger.info(f" Total Processing time: {total_time:.2f} seconds")
+
+        return model, mapping_info
+    
+    except Exception as e:
+        logger.error(f"Error in training model on pipeline: {str(e)}")
+        return None
+
 
 
 if __name__ == '__main__':
