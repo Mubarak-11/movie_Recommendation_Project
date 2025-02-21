@@ -7,6 +7,7 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 import gc,time,psutil,functools
+import re
 from typing import Iterator, Dict, Tuple, List, Optional
 import logging
 from pathlib import Path
@@ -349,13 +350,31 @@ class moviedataload():
             self.logger.error(f"Reading failed: {str(e)}")  # Fixed errors to error
             raise
 
-#New class to help prepare the raw dataset for the matrix factorization class:
+#New class to help prepare the dataset for the matrix factorization class + apply temporal feature for tuning the model:
 class data_for_mf(Dataset):
     def __init__(self, movie_ratings, ratings_scale = 5.0):
         self.userID = torch.LongTensor(movie_ratings['userID'].values)
         self.movieID = torch.LongTensor(movie_ratings['movieID'].values)
         self.ratings = torch.FloatTensor(movie_ratings['rating'].values) / ratings_scale
     
+        # Calculate the movie age at the time of ratings
+        rating_timestamp = pd.to_datetime(movie_ratings['timestamp'])
+        ratings_years = rating_timestamp.dt.year.values
+
+        #extract movie release years from titles
+        release_years = movie_ratings['title'].str.extract(r'\((\d{4})\)').astype(float).values.flatten()
+
+        #calculate age and handle potential negative ages (in case of data errors)
+        movie_ages = ratings_years - release_years
+        movie_ages = np.maximum(0, movie_ages)  #ensure no negative ages
+
+        #normalize ages into reasonable buckets for embedding layers (0-5 years, 5-10 years, etc)
+        age_buckets = np.floor(movie_ages /5).astype(int)   #group into 5 year buckets
+        self.age_buckets = torch.LongTensor(age_buckets)
+
+        #keep track of number of unique age buckets for embedding layer
+        self.n_age_buckets = age_buckets.max()+1
+
     def __len__(self):
         return len(self.ratings)
     
@@ -363,13 +382,14 @@ class data_for_mf(Dataset):
         return {
             'userID': self.userID[index],
             'movieID': self.movieID[index],
-            'rating': self.ratings[index]
+            'rating': self.ratings[index],
+            'age_bucket' : self.age_buckets[index]
         }
 
 
 #Matrix factorization for decomposition with Adaptive Moment Estimiation (ADAM) 
 class matrix_fact(nn.Module):
-    def __init__(self, n_users, n_movies, n_factors=100):
+    def __init__(self, n_users, n_movies, n_age_buckets , n_factors=100):
         super().__init__()
         """
         Create the parent class/function to perform the matrix factorization:
@@ -383,14 +403,17 @@ class matrix_fact(nn.Module):
         self.user_factors  = nn.Embedding(n_users, n_factors)
         self.movie_factors = nn.Embedding(n_movies, n_factors)
 
+        self.age_factors = nn.Embedding(n_age_buckets, n_factors) #temporal feature for age buckets
+
         # Add normalization and dropout
         self.user_norm = nn.LayerNorm(n_factors)
         self.movie_norm = nn.LayerNorm(n_factors)
-        self.dropout = nn.Dropout(0.2)
-
-        #initilize the embeddings with random values
-        self.user_factors.weight.data.normal_(0,0.1)
-        self.movie_factors.weight.data.normal_(0, 0.1)
+        self.age_norm = nn.LayerNorm(n_factors)
+    
+        #initilize the embeddings with Xavier/Glorot normal initialiations
+        nn.init.xavier_normal_(self.user_factors.weight)
+        nn.init.xavier_normal_(self.movie_factors.weight)
+        nn.init.xavier_normal_(self.age_factors.weight)
 
         #create the bias terms, to help the model (adjustment factors that help capture basic tendencies)
         self.user_bias = nn.Embedding(n_users, 1)
@@ -400,19 +423,37 @@ class matrix_fact(nn.Module):
         self.to(DEVICE)
     
     #the predicition function
-    def forward(self, user_ids, movie_ids):
+    def forward(self, user_ids, movie_ids, age_bucket_ids):
         
         #get the latent factor for each user and movie
         users = self.user_factors(user_ids)
         movies = self.movie_factors(movie_ids)
+        ages = self.age_factors(age_bucket_ids)
+
+        #Applying ReLu activaction to help us capture positive interactions more effectively
+        users = torch.relu(users)
+        movies = torch.relu(movies)
+        ages = torch.relu(ages)
+
+        #Applying layer normalization: constant adjustments, to keep the positive values well behaved
+        users = self.user_norm(users)
+        movies = self.movie_norm(movies)
+        ages = self.age_norm(ages)
 
         user_bias = self.user_bias(user_ids).squeeze()
         movie_bias = self.movie_bias(movie_ids).squeeze()
 
-        #calculate the dot product:
-        dot_product = (users * movies).sum(dim=1)
+        #calculate for dot product now:
+        
+        movie_with_ages = movies * ages
+        combined_features = users * movie_with_ages
 
-        predicitions = torch.sigmoid(dot_product + user_bias + movie_bias + self.global_bias)   #we apply torch sigmoid to keep the prediction rating low
+        dot_product = combined_features.sum(dim=1)
+
+        predicitions = dot_product / torch.sqrt(torch.tensor(users.shape[1]).float())   #combine all components and scale by embedding dimension for numerical stability
+        predicitions = predicitions + user_bias + movie_bias + self.global_bias
+        
+        predicitions = torch.clamp(predicitions, -0.1, 1.1)  #Clamp predictions to our slightly extended range
 
         return predicitions
     
@@ -423,7 +464,7 @@ class matrix_fact(nn.Module):
         user_mapping = {old_id: new_id for new_id, old_id in 
                         enumerate(movie_ratings['userID'].unique())}
         movie_mapping = {old_id: new_id for new_id, old_id in
-                         enumerate(movie_ratings['movieID'].unique())}
+                         enumerate(movie_ratings['movieID'].unique())}     
         
         #create a copy and reindex:
         movie_ratings = movie_ratings.copy()
@@ -434,12 +475,16 @@ class matrix_fact(nn.Module):
         n_users = len(user_mapping)
         n_movies = len(movie_mapping)
 
+        #Create dataset to get number of age buckets
+        dataset = data_for_mf(movie_ratings, ratings_scale=5.0)
+        n_age_buckets = dataset.n_age_buckets
 
-        model = matrix_fact(n_users, n_movies, n_factors)
-        optimizer = optim.Adam(model.parameters(), lr = 0.005, weight_decay = 0.0005)
+        #initilize the model with age of buckets parameter
+        model = matrix_fact(n_users, n_movies, n_age_buckets, n_factors)
+        optimizer = optim.Adam(model.parameters(), lr = 0.005, weight_decay = 0.0001)
 
-        #define the Mean squared Error for error calculation
-        criterion = nn.SmoothL1Loss()
+        #Use the huberloss to handle outliers 
+        criterion = nn.HuberLoss(delta=1.0)
 
         ratings_scale = 5.0   #used to bring the ratings to 0-1, rather than 1-5, easier for the model to understand
 
@@ -460,13 +505,14 @@ class matrix_fact(nn.Module):
                 users = batch['userID'].to(DEVICE)
                 movies = batch['movieID'].to(DEVICE)
                 ratings = batch['rating'].to(DEVICE)
+                age_buckets = batch['age_bucket'].to(DEVICE)
 
 
                 #clear our the previous gradients
                 optimizer.zero_grad()
 
                 #forward pass
-                predicitions = model(users, movies)
+                predicitions = model(users, movies, age_buckets)
 
                 #calculate loss
                 loss = criterion(predicitions, ratings)   # if our model predicts 0.8 even when rating is 1.0, mse = (1-0.8)² = 0.04
@@ -479,10 +525,6 @@ class matrix_fact(nn.Module):
 
                 total_loss += loss.item()
                 total_count += 1
-
-                #clear memory cache
-                #del predicitions, loss, users, movies, ratings
-                #torch.cuda.empty_cache()
             
             if (epoch + 1)%5 == 0:
                 #convert loss back to original rating scale for interpeliety
@@ -669,7 +711,7 @@ def main():
             logger.info("Starting model training...")
             model, ratings_scale, (user_mapping, movie_mapping) = matrix_fact.train_model(
                 movie_ratings,
-                n_factors=64,
+                n_factors=128,
                 n_epochs=50, 
                 batch_size=4096
             )
@@ -708,12 +750,25 @@ def main():
                     
                     if len(user_data) > 0:
                         for _, row in user_data.iterrows():
+
+                            # Calculate movie age for prediction
+                            rating_year = pd.to_datetime(row['timestamp']).year
+                            release_year = float(re.search(r'\((\d{4})\)', row['title']).group(1))
+                            movie_age = rating_year - release_year
+                            age_bucket = int(np.floor(max(0, movie_age) / 5))
+
+                            #convert to tensors
                             user = torch.LongTensor([user_mapping[row['userID']]]).to(DEVICE)
                             movie = torch.LongTensor([movie_mapping[row['movieID']]]).to(DEVICE)
-                            prediction = model(user, movie)
+                            age = torch.LongTensor([age_bucket]).to(DEVICE)
+
+                            #get predictions
+                            prediction = model(user, movie, age)
 
                             scaled_prediction = prediction.item() * ratings_scale
-                            logger.info(f"Movie {row['movieID']}: Predicted = {scaled_prediction:.2f}, Actual = {row['rating']}")
+                            #Log with additional information
+                            logger.info(f"Movie {row['movieID']} ({row['title']}): "f"Predicted = {scaled_prediction:.2f}, "f"Actual = {row['rating']} "
+                                f"(Movie age when rated: {movie_age:.1f} years)")
                     else:
                         logger.info(f"No ratings found for user {test_user}")
 
