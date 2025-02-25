@@ -387,6 +387,38 @@ class data_for_mf(Dataset):
         }
 
 
+#Our own custom weight loss to help solve the prediction inaccuracy for ratings below 2 and above 4.5. This aims to predicte ratings that are 1/5 much closer to the actual ratings
+class Weightratingloss(nn.Module):
+    def __init__(self, alpha = 3.0, beta = 2.0, low_rating_boost = 3.0, high_rating_boost = 2.0):
+        super().__init__()
+        self.alpha = alpha  #weight for extreme ratings
+        self.beta = beta    #Power factor to emphasize the extremes
+        self.low_rating_boost = low_rating_boost    #Extra weight for low ratings
+        self.high_rating_boost = high_rating_boost  #Extra weight for high ratings
+
+    def forward(self, predictions, targets):
+        #Basic error calculation - absolute difference
+        base_loss = torch.abs(predictions - targets)
+
+        #calculate how extreme the target rating is (distance from the middle)
+        rating_extremity = torch.pow(torch.abs(targets - 0.5), self.beta)
+
+        # Add extra weight for low/high ratings (below 0.3 normalized, or below 1.5 stars)
+        low_rating_mask = targets < 0.3 #below 1.5 stars
+        high_rating_mask = targets > 0.9  #Above 4.5 stars
+
+        rating_factor = torch.ones_like(targets)
+        rating_factor[low_rating_mask] = self.low_rating_boost
+        rating_factor[high_rating_mask] = self.high_rating_boost
+
+        # Final weighted loss combines all factors:
+        # 1. Base error (absolute difference)
+        # 2. General extremity weighting (distance from middle)
+        # 3. Special boost for very low/high ratings
+        weighted_loss = base_loss * (1+self.alpha *rating_extremity)*rating_factor
+
+        return weighted_loss.mean()
+
 #Matrix factorization for decomposition with Adaptive Moment Estimiation (ADAM) 
 class matrix_fact(nn.Module):
     def __init__(self, n_users, n_movies, n_age_buckets , n_factors=100):
@@ -484,7 +516,7 @@ class matrix_fact(nn.Module):
         optimizer = optim.Adam(model.parameters(), lr = 0.005, weight_decay = 0.0001)
 
         #Use the huberloss to handle outliers 
-        criterion = nn.HuberLoss(delta=1.0)
+        criterion = Weightratingloss(alpha=3.0, beta=2.0)
 
         ratings_scale = 5.0   #used to bring the ratings to 0-1, rather than 1-5, easier for the model to understand
 
@@ -766,9 +798,13 @@ def main():
                             prediction = model(user, movie, age)
 
                             scaled_prediction = prediction.item() * ratings_scale
+                            rounded_prediction = round(scaled_prediction *2)/2  #Round to the nearst 0.5
+
                             #Log with additional information
-                            logger.info(f"Movie {row['movieID']} ({row['title']}): "f"Predicted = {scaled_prediction:.2f}, "f"Actual = {row['rating']} "
-                                f"(Movie age when rated: {movie_age:.1f} years)")
+                            logger.info(f"Movie {row['movieID']} ({row['title']}): "
+                            f"Predicted = {rounded_prediction:.1f}, "  # .1f for consistent decimal places
+                            f"Actual = {row['rating']} "
+                            f"(Movie age when rated: {movie_age:.1f} years)")
                     else:
                         logger.info(f"No ratings found for user {test_user}")
 
