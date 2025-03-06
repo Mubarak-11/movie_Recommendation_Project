@@ -15,6 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch, torchvision, torchgen, torch.nn as nn, torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, DataChunk
+from sklearn.model_selection import train_test_split
 
 #Basic logging
 logging.basicConfig(level = logging.INFO, format='%(asctime)s- %(levelname)s - %(message)s')
@@ -437,6 +438,8 @@ class matrix_fact(nn.Module):
 
         self.age_factors = nn.Embedding(n_age_buckets, n_factors) #temporal feature for age buckets
 
+        self.dropout = nn.Dropout(0.2)  #Add dropout for more regularization
+
         # Add normalization and dropout
         self.user_norm = nn.LayerNorm(n_factors)
         self.movie_norm = nn.LayerNorm(n_factors)
@@ -468,7 +471,7 @@ class matrix_fact(nn.Module):
         ages = torch.relu(ages)
 
         #Applying layer normalization: constant adjustments, to keep the positive values well behaved
-        users = self.user_norm(users)
+        users = self.dropout(self.user_norm(torch.relu(users)))
         movies = self.movie_norm(movies)
         ages = self.age_norm(ages)
 
@@ -516,8 +519,7 @@ class matrix_fact(nn.Module):
         optimizer = optim.Adam(model.parameters(), lr = 0.005, weight_decay = 0.0001)
 
         #Use the huberloss to handle outliers 
-        criterion = Weightratingloss(alpha=3.0, beta=2.0)
-
+        criterion = Weightratingloss(alpha=5.0, beta=3.0)
         ratings_scale = 5.0   #used to bring the ratings to 0-1, rather than 1-5, easier for the model to understand
 
         #create dataset/dataloader
@@ -572,8 +574,122 @@ class matrix_fact(nn.Module):
         model.load_state_dict(best_model_state) #now load that
         return model, ratings_scale, (user_mapping, movie_mapping)
 
+#lets evaulate the model and test on unseen data
+def evaluate_model(model, test_data, user_mapping, movie_mapping, ratings_scale, max_chunk_size = 100000, batch_size = 512):
+    """
+    Evaluate the model performance on unseen test data
 
+    Arguments:
+        model: train matrix factoriazation model
+        test_data: Dataframe containing test data
+        user_mapping: dict mapping userID to indices
+        movie_mapping: dict mapping movieID to indicies
+        ratings_scale: Scale factor for adjusting ratings
 
+    Returns:
+        dict of evaluation metrics
+    """
+
+    #split test data into managable chunks
+    
+    test_chunks = []
+    for i in range(0, len(test_data), max_chunk_size):
+        end_idx = min(i + max_chunk_size, len (test_data))
+        test_chunks.append(test_data.iloc[i:end_idx])
+    
+    all_preds = []
+    all_actuals = []
+
+    logger.info(f"Evaluating in {len(test_chunks)} chunks of max size {max_chunk_size}")
+    
+    for chunk_idx, chunk in enumerate(test_chunks):
+        logger.info(f"Processing evaluation chunk {chunk_idx+1}/{len(test_chunks)}")
+
+        #prepare dataset for this chunk only
+        dataset = data_for_mf(chunk, ratings_scale)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        chunk_preds = []
+        chunk_actuals = []        
+    
+        #process batches within this chunk
+        with torch.no_grad():
+            for batch in dataloader:
+                users = batch['userID'].to(DEVICE)
+                movies = batch['movieID'].to(DEVICE)
+                ratings = batch['rating'].to(DEVICE)
+                ages = batch['age_bucket'].to(DEVICE)
+
+                batch_pred = model(users, movies, ages)
+
+                # Immediately move to CPU and convert to numpy to free GPU memory
+                chunk_preds.append((batch_pred * ratings_scale).cpu().numpy())
+                chunk_actuals.append((ratings * ratings_scale).cpu().numpy())
+                    
+                # Explicitly delete tensors and clear cache
+                del users, movies, ratings, ages, batch_pred
+                torch.cuda.empty_cache()
+        
+        #combine chunk results and add to the overall result
+
+        chunk_preds_np = np.concatenate(chunk_preds)
+        chunk_actuals_np = np.concatenate(chunk_actuals)
+
+        all_preds.append(chunk_preds_np)
+        all_actuals.append(chunk_actuals_np)
+
+        #clear chunk data to free memory
+        del chunk_preds,chunk_actuals, chunk_preds_np, chunk_actuals_np
+        gc.collect()    #force garbage collection
+
+    #combine all chunks
+    predictions_np = np.concatenate(all_preds)
+    actuals_np = np.concatenate(all_actuals)
+    
+    # Calculate metrics on CPU
+    mae = np.mean(np.abs(predictions_np - actuals_np))
+    rmse = np.sqrt(np.mean((predictions_np - actuals_np) ** 2))
+  
+    #Round predictions to nearst 0.5 for display purposes
+    rounds_pred = np.round(predictions_np *2)/2
+
+    #calculate accuracy metrics
+    exact_match = np.mean(rounds_pred == actuals_np)
+    within_half_star = np.mean(np.abs (rounds_pred - actuals_np) <= 0.5)
+    within_one_star = np.mean(np.abs(rounds_pred - actuals_np) <= 1.0)
+
+    # Display sample predictions
+    logger.info("Sample predictions from test set: ")
+    sample_indices = np.random.choice(len(predictions_np), min(20, len(predictions_np)), replace=False)
+
+    for idx in sample_indices:
+        logger.info(f"Predicted: {rounds_pred[idx]:.1f}, Actual: {actuals_np[idx]:.1f}, "
+            f"Error: {abs(rounds_pred[idx] - actuals_np[idx]):.1f}")
+    
+    #Summarize performance by rating category:
+    rating_categories = [1.0, 2.0, 3.0, 4.0, 5.0]
+    logger.info("Performace by rating category: ")
+    for rating in rating_categories:
+        mask = np.isclose(actuals_np, rating)
+        if np.sum(mask) >0:
+            category_mae = np.mean(np.abs(predictions_np[mask] - actuals_np[mask]))
+            logger.info(f"Rating {rating:.1f}: MAE = {category_mae:.4f}, Count = {np.sum(mask)}")
+        
+    #Return all metrics
+    metrics = {
+        'mae':mae,
+        'rmse': rmse,
+        'exact_match': exact_match,
+        'within_half_star':within_half_star,
+        'within_one_star':within_one_star
+    }
+
+    logger.info(f" Overall metrics - MAE : {mae:.4f}, RMSE: {rmse:.4f}")
+    logger.info(f"Accuracy - Exact: {exact_match:.2%}, Within 0.5: {within_half_star:.2%}, "
+            f"Within 1.0: {within_one_star:.2%}")
+
+    return metrics
+    
 def main():
     """
     Main function to load and process all data files.
@@ -716,7 +832,9 @@ def main():
         logging.error(f"An error occurred: {str(e)}")
         return None
     """
-    #Lets train the model on the ETL we saved!
+    #Lets apply the train/test evaluation
+    
+    start_time = time.time()
     try:
 
         # 1. Load processed data
@@ -724,105 +842,60 @@ def main():
         base_path = Path("data/processed")
 
         logger.info(f"Loading data from parquet files")
-        try:
-            # Read partitioned parquet data
-            movie_ratings = pd.read_parquet(str(base_path / "movie_ratings"),engine='pyarrow')
+        
+        # Read partitioned parquet data
+        movie_ratings = pd.read_parquet(str(base_path / "movie_ratings"),engine='pyarrow')
             
-            logger.info(f"Original Dataset size: {len(movie_ratings):,}")
+        logger.info(f"Original Dataset size: {len(movie_ratings):,}")
 
-            #take a sample for training the model quicker:
-            movie_ratings = movie_ratings.sample(n=750000, random_state= 42)
-            logger.info(f"Sampled dataset size: {len(movie_ratings):,}")
+        # 2. Start with a small subset to verify pipeline works
+        sample_size = 3500000  # 20% of total data
+        logger.info(f"Creating proof-of-concept with {sample_size:,} samples")
+        
+        sample_data = movie_ratings.sample(n=sample_size, random_state=42)
+        train_data, test_data = train_test_split(sample_data, test_size=0.2, random_state=42)
+        
             
-            logger.info(f"Unique users in sample: {movie_ratings['userID'].nunique():,}")
-            logger.info(f"Unique movies in sample: {movie_ratings['movieID'].nunique():,}")
-            logger.info(f"Memory usage: {movie_ratings.memory_usage().sum() / 1024**2:.2f} MB")
-            
-            
-            # 3. Train model with optimized parameters
-            logger.info("Starting model training...")
-            model, ratings_scale, (user_mapping, movie_mapping) = matrix_fact.train_model(
-                movie_ratings,
-                n_factors=128,
-                n_epochs=50, 
-                batch_size=4096
+        logger.info(f"Training set size: {len(train_data):,}")
+        logger.info(f"Testing set size: {len(test_data):,}")
+
+
+        # 3. Train model on training parameter only
+        logger.info("Starting model training...")
+        model, ratings_scale, (user_mapping, movie_mapping) = matrix_fact.train_model(
+                train_data,
+                n_factors=64,
+                n_epochs=15, 
+                batch_size=1024
             )
 
-            #save model/mappings
-            save_path = Path("model")
-            save_path.mkdir(exist_ok= True)
+        #4. save model/mappings
+        save_path = Path("model")
+        save_path.mkdir(exist_ok= True)
+        torch.save(model.state_dict(), save_path / "movie_recommender_model.pth")
 
-            #save model state:
-            torch.save(model.state_dict(), save_path / "movie_recommender_model.pth")
-
-            #save these mappings for future use:
-            mapping_info = {
+        #save these mappings for future use:
+        mapping_info = {
                 'user_mapping': user_mapping,
                 'movie_mapping': movie_mapping,
                 'ratings_scale': ratings_scale
             }
-            torch.save(mapping_info, save_path / "mapping_info.pth")
+        torch.save(mapping_info, save_path / "mapping_info.pth")
 
-            logger.info("model training completed successfully!!")
-            #logger.info(f"Created embeddings for {len(user_mapping):,} users and {len(movie_mapping):,} movies")
-            #logger.info(f"Model and mappings saved to {save_path}")
+        #5 .Evaulate the model on the test data...
+        logger.info("Evaulating the model on test data...")
+        # Or with custom values
+        metrics = evaluate_model(model, test_data, user_mapping, movie_mapping, ratings_scale, max_chunk_size=5000, batch_size=64)
 
-             #lets test the model now:
-    
-            logger.info("Testing the model predictions...")
-
-            # Get the first few users for testing
-            test_users = movie_ratings['userID'].unique()[:5]  # Test first 5 users
-            logger.info(f"Testing predictions for users: {test_users}")
-
-            with torch.no_grad():
-                for test_user in test_users:
-                    user_data = movie_ratings[movie_ratings['userID'] == test_user].head()  # Get first 5 movies for each user
-                    logger.info(f"\nPredictions for user {test_user}:")
-                    
-                    if len(user_data) > 0:
-                        for _, row in user_data.iterrows():
-
-                            # Calculate movie age for prediction
-                            rating_year = pd.to_datetime(row['timestamp']).year
-                            release_year = float(re.search(r'\((\d{4})\)', row['title']).group(1))
-                            movie_age = rating_year - release_year
-                            age_bucket = int(np.floor(max(0, movie_age) / 5))
-
-                            #convert to tensors
-                            user = torch.LongTensor([user_mapping[row['userID']]]).to(DEVICE)
-                            movie = torch.LongTensor([movie_mapping[row['movieID']]]).to(DEVICE)
-                            age = torch.LongTensor([age_bucket]).to(DEVICE)
-
-                            #get predictions
-                            prediction = model(user, movie, age)
-
-                            scaled_prediction = prediction.item() * ratings_scale
-                            rounded_prediction = round(scaled_prediction *2)/2  #Round to the nearst 0.5
-
-                            #Log with additional information
-                            logger.info(f"Movie {row['movieID']} ({row['title']}): "
-                            f"Predicted = {rounded_prediction:.1f}, "  # .1f for consistent decimal places
-                            f"Actual = {row['rating']} "
-                            f"(Movie age when rated: {movie_age:.1f} years)")
-                    else:
-                        logger.info(f"No ratings found for user {test_user}")
-
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                logger.error("GPU memory error. Consider: ")
-                logger.error(" Reducing batch_size, Reducing n_factors or taking a sample from the data (50,000)")
-                raise e
-        
+        #6. Total processing Time        
         total_time = time.time() - start_time
         logger.info(f" Total Processing time: {total_time:.2f} seconds")
 
-        return model, mapping_info
+        return model, mapping_info, metrics
     
     except Exception as e:
         logger.error(f"Error in training model on pipeline: {str(e)}")
         return None
-
 
 
 if __name__ == '__main__':

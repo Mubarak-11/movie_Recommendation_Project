@@ -99,3 +99,10 @@ Matrix_fact_using_pytorch.py
 ratings.dat
 similarity_matrix.mmap
 Movie_ratings.csv
+model/mapping_info.pth
+classifier_mapping.pth
+model/movie_recommender_model.pth
+best_classifier.pth
+models/classifier/classifier.pth
+models/classifier/classifier_mappings.pth
+__pycache__/two_model_movie_pred.cpython-310.pyc
