@@ -3,6 +3,8 @@ Goal is to practise my python skills (data analysis/engineering/science) and gen
 
 You must get the main files from: https://grouplens.org/datasets/movielens/
   - Download any dataset (I chose 10 million) and save it in your folder
+  - convert all .dat files into .csv files
+  - combine movie.csv and ratings.csv into movie_ratings.csv or your code won't run for option 1/2. 
 
 3 Options:
 
